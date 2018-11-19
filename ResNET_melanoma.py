@@ -1,0 +1,177 @@
+""" ResNET Melanoma:
+  n=7, time/epoch = 33s,[parameters total=1,948,130, non-trainable=12,128], test_acccuracy = 0.81667
+  n=17, time/epoch = 74s,[parameters total=4,697,250, non-trainable=29,408], test_accuracy = 0.82
+  n=27, time/epoch = 116s,[parameters total=7,446,370, non-trainable=46688], test_accuracy = 0.81167
+  n=37, time/epoch = 158s,[parameters total=10,195,490, non-trainable=63,968], test_accuracy = 0.84
+"""
+
+from __future__ import print_function
+import keras
+from keras.optimizers import Adam
+from keras.callbacks import ModelCheckpoint, LearningRateScheduler
+from keras.callbacks import ReduceLROnPlateau, CSVLogger
+from keras.preprocessing.image import ImageDataGenerator
+from keras.regularizers import l2
+from keras import backend as K
+from keras.models import Model
+import numpy as np
+import os
+import pickle
+import sys
+from ResNET_model import resnet_v2
+from ResNET_model import resnet_v1
+
+# Training parameters
+batch_size = 8  
+epochs = 200
+data_augmentation = True
+num_classes = 2
+
+# Subtracting pixel mean improves accuracy
+subtract_pixel_mean = True
+n = 37
+
+version = 2
+
+if version == 1:
+    depth = n * 6 + 2
+elif version == 2:
+    depth = n * 9 + 2
+
+model_type = 'ResNet%dv%d' % (depth, version)
+
+
+train = pickle.load( open( 'ISIC2017_train_melanoma_colored.p', "rb" ) )
+val = pickle.load( open( 'ISIC2017_val_melanoma_colored.p', "rb" ) )
+test = pickle.load( open( 'ISIC2017_test_melanoma_colored.p', "rb" ) )
+
+
+x_train = train['features']
+y_train = train['labels']
+x_val = val['features']
+y_val= val['labels']
+x_test = test['features']
+y_test = test['labels']
+
+# Input image dimensions.
+input_shape = x_train.shape[1:]
+
+# Normalize data.
+x_train = x_train.astype('float32') / 255
+x_val = x_val.astype('float32') / 255
+x_test = x_test.astype('float32') / 255
+
+# If subtract pixel mean is enabled
+if subtract_pixel_mean:
+    x_train_mean = np.mean(x_train, axis=0)
+    x_train -= x_train_mean
+    x_val -= x_train_mean
+    x_test -= x_train_mean
+
+# Convert class vectors to binary class matrices.
+y_train = keras.utils.to_categorical(y_train, num_classes)
+y_val = keras.utils.to_categorical(y_val, num_classes)
+y_test = keras.utils.to_categorical(y_test, num_classes)
+
+
+def lr_schedule(epoch):
+    lr = 1e-3
+    if epoch > 180:
+        lr *= 1e-4
+    elif epoch > 160:
+        lr *= 0.5e-3
+    elif epoch > 140:
+        lr *= 1e-3
+    elif epoch >120:
+        lr *= 0.5e-2
+    elif epoch > 100:
+        lr *= 1e-2
+    elif epoch >60:
+        lr *= 0.5e-1
+    elif epoch > 0:
+        lr *= 1e-1
+    print('Learning rate: ', lr)
+    return lr
+
+if version == 2:
+    model = resnet_v2(input_shape=input_shape, depth=depth, num_classes=num_classes)
+else:
+    model = resnet_v1(input_shape=input_shape, depth=depth, num_classes=num_classes)
+
+model.compile(loss='categorical_crossentropy',
+              optimizer=Adam(lr=lr_schedule(0)),
+              metrics=['accuracy'])
+#model.summary()
+print(model_type)
+
+# Prepare model model saving directory.
+save_dir = os.path.join(os.getcwd(), 'saved_models')
+model_na='IS17_ResNET_melanoma_'+str(depth)+'_64x64p'
+modle_na = 'Test'
+model_name = model_na+'.h5'
+
+if not os.path.isdir(save_dir):
+    os.makedirs(save_dir)
+filepath = os.path.join(save_dir, model_name)
+
+# Prepare callbacks for model saving and for learning rate adjustment.
+# Note that save_weights_only was set to True because big memory required to save the whole model
+checkpoint = ModelCheckpoint(filepath=filepath,
+                             monitor='val_acc',
+                             verbose=1,
+                             save_best_only=True,
+                             save_weights_only=True)
+
+lr_scheduler = LearningRateScheduler(lr_schedule)
+
+lr_reducer = ReduceLROnPlateau(factor=np.sqrt(0.1),
+                               cooldown=0,
+                               patience=5,
+                               min_lr=0.5e-6)
+csv_logger = CSVLogger(model_na+'.log')
+
+callbacks = [checkpoint, lr_reducer, lr_scheduler, csv_logger]
+
+# Run training, with or without data augmentation.
+if not data_augmentation:
+    print('Not using data augmentation.')
+    model.fit(x_train, y_train,
+              batch_size=batch_size,
+              epochs=epochs,
+              validation_data=(x_test, y_test),
+              shuffle=True,
+              callbacks=callbacks)
+else:
+    print('Using real-time data augmentation.')
+    # preprocessing  and realtime data augmentation
+    datagen = ImageDataGenerator(
+        featurewise_center=False, 
+        samplewise_center=False, 
+        featurewise_std_normalization=False,
+        samplewise_std_normalization=False,
+        zca_whitening=False,
+        rotation_range=0,
+        width_shift_range=0.1,
+        height_shift_range=0.1,
+        horizontal_flip=True,
+        vertical_flip=False)
+
+    datagen.fit(x_train)
+
+    # Fit the model on the batches generated by datagen.flow().
+    model.fit_generator(datagen.flow(x_train, y_train, batch_size=batch_size),
+                        validation_data=(x_test, y_test),
+                        epochs=epochs, verbose=1, workers=4,
+                        callbacks=callbacks)
+
+
+# Loads best weight, if you just want to the prediction and evaluation of data
+model.load_weights('saved_models/'+model_name)
+
+model.compile(loss='categorical_crossentropy',
+              optimizer=Adam(lr=lr_schedule(0)),
+              metrics=['accuracy'])
+
+scores = model.evaluate(x_test, y_test, verbose=1)
+print('Test loss:', scores[0])
+print('Test accuracy:', scores[1])
